@@ -25,7 +25,7 @@ import bisect
 
 from net import Net
 
-def weight_variable(shape, name=None):
+def weight_variable(shape, name=None, regularize=False):
     """Xavier initialization"""
     if len(shape) == 4:
         receptive_field = shape[0] * shape[1]
@@ -39,7 +39,8 @@ def weight_variable(shape, name=None):
     stddev = trunc_correction * np.sqrt(2.0 / (fan_in + fan_out))
     initial = tf.truncated_normal(shape, stddev=stddev)
     weights = tf.Variable(initial, name=name)
-    tf.add_to_collection(tf.GraphKeys.REGULARIZATION_LOSSES, weights)
+    if regularize:
+        tf.add_to_collection(tf.GraphKeys.REGULARIZATION_LOSSES, weights)
     return weights
 
 # Bias weights for layers not followed by BatchNorm
@@ -63,7 +64,9 @@ class TFProcess:
         self.RESIDUAL_FILTERS = self.cfg['model']['filters']
         self.RESIDUAL_BLOCKS = self.cfg['model']['residual_blocks']
         self.SE_ratio = self.cfg['model']['se_ratio']
+
         self.policy_channels = self.cfg['model'].get('policy_channels', 32)
+
 
         # For exporting
         self.weights = []
@@ -90,23 +93,70 @@ class TFProcess:
         self.train_handle = self.session.run(train_iterator.string_handle())
         self.test_handle = self.session.run(test_iterator.string_handle())
         self.init_net(self.next_batch)
+        for teacher, weights in zip(self.teacher_nets, self.teacher_weights):
+            self.replace_weights(teacher.get_weights(), weight_vars=weights, old_format=True)
 
     def init_net(self, next_batch):
         self.x = next_batch[0]  # tf.placeholder(tf.float32, [None, 112, 8*8])
         self.y_ = next_batch[1] # tf.placeholder(tf.float32, [None, 1858])
         self.z_ = next_batch[2] # tf.placeholder(tf.float32, [None, 1])
-        self.batch_norm_count = 0
-        self.y_conv, self.z_conv = self.construct_net(self.x)
 
+        if not isinstance(self.cfg['training']['teacher_path'], list):
+            self.cfg['training']['teacher_path'] = [self.cfg['training']['teacher_path']]
+
+        self.teacher_nets = []
+        self.teacher_weights = []
+        teacher_ys = []
+        teacher_zs = []
+        for i, teacher_path in enumerate(self.cfg['training']['teacher_path']):
+            net = Net()
+            net.parse_proto(teacher_path)
+            self.teacher_nets.append(net)
+
+            student_filters, self.RESIDUAL_FILTERS = self.RESIDUAL_FILTERS, net.filters()
+            student_blocks, self.RESIDUAL_BLOCKS = self.RESIDUAL_BLOCKS, net.blocks()
+
+            self.batch_norm_count = 0
+            with tf.variable_scope('teacher{}'.format(i)):
+                self.distill_phase = 'teacher{}'.format(i)
+                y_teacher, z_teacher = self.construct_net(self.x, old_format=True)
+                y_teacher = tf.stop_gradient(tf.nn.softmax(y_teacher / self.cfg['training']['teacher_temp']))
+                z_teacher = tf.stop_gradient(z_teacher)
+                teacher_ys.append(y_teacher)
+                teacher_zs.append(z_teacher)
+
+            trainable_vars = tf.get_collection_ref(tf.GraphKeys.TRAINABLE_VARIABLES)
+            del trainable_vars[:]
+
+            self.RESIDUAL_FILTERS = student_filters
+            self.RESIDUAL_BLOCKS = student_blocks
+
+            self.teacher_weights.append(self.weights)
+            self.weights = []
+
+        self.y_teacher = tf.reduce_mean(teacher_ys, 0)
+        self.z_teacher = tf.reduce_mean(teacher_zs, 0)
+
+        self.batch_norm_count = 0
+        with tf.variable_scope('student'):
+            self.distill_phase = 'student'
+            self.y_student, self.z_student = self.construct_net(self.x)
+
+        distill_ratio = self.cfg['training']['distill_ratio']
         # Calculate loss on policy head
-        cross_entropy = \
-            tf.nn.softmax_cross_entropy_with_logits(labels=self.y_,
-                                                    logits=self.y_conv)
-        self.policy_loss = tf.reduce_mean(cross_entropy)
+        cross_entropy = tf.nn.softmax_cross_entropy_with_logits
+        self.policy_loss = tf.cond(self.training,
+            lambda: (1 - distill_ratio) * tf.reduce_mean(cross_entropy(labels=self.y_, logits=self.y_student)) + \
+                  distill_ratio * tf.reduce_mean(cross_entropy(labels=self.y_teacher, logits=self.y_student)),
+            lambda: tf.reduce_mean(cross_entropy(labels=self.y_, logits=self.y_student))
+        )
 
         # Loss on value head
-        self.mse_loss = \
-            tf.reduce_mean(tf.squared_difference(self.z_, self.z_conv))
+        self.mse_loss = tf.cond(self.training,
+            lambda: (1 - distill_ratio) * tf.reduce_mean(tf.squared_difference(self.z_, self.z_student)) + \
+                  distill_ratio * tf.reduce_mean(tf.squared_difference(self.z_teacher, self.z_student)),
+            lambda: tf.reduce_mean(tf.squared_difference(self.z_, self.z_student))
+        )
 
         # Regularizer
         regularizer = tf.contrib.layers.l2_regularizer(scale=0.0001)
@@ -164,7 +214,7 @@ class TFProcess:
             [(accum, gradient[1]) for accum, gradient in zip(gradient_accum, gradients)], global_step=self.global_step)
 
         correct_prediction = \
-            tf.equal(tf.argmax(self.y_conv, 1), tf.argmax(self.y_, 1))
+            tf.equal(tf.argmax(self.y_student, 1), tf.argmax(self.y_, 1))
         correct_prediction = tf.cast(correct_prediction, tf.float32)
         self.accuracy = tf.reduce_mean(correct_prediction)
 
@@ -211,7 +261,7 @@ class TFProcess:
                 s = weights.shape.as_list()
                 shape = [s[i] for i in [3, 2, 0, 1]]
                 new_weight = tf.constant(new_weights[e], shape=shape)
-                self.session.run(weights.assign(tf.transpose(new_weight, [2, 3, 1, 0])))
+                ops.append(weights.assign(tf.transpose(new_weight, [2, 3, 1, 0])))
             elif weights.shape.ndims == 2:
                 # Fully connected layers are [in, out] in TF
                 #
@@ -220,11 +270,12 @@ class TFProcess:
                 s = weights.shape.as_list()
                 shape = [s[i] for i in [1, 0]]
                 new_weight = tf.constant(new_weights[e], shape=shape)
-                self.session.run(weights.assign(tf.transpose(new_weight, [1, 0])))
+                ops.append(weights.assign(tf.transpose(new_weight, [1, 0])))
             else:
                 # Biases, batchnorm etc
                 new_weight = tf.constant(new_weights[e], shape=weights.shape)
-                self.session.run(tf.assign(weights, new_weight))
+                ops.append(tf.assign(weights, new_weight))
+        self.session.run(ops)
         #This should result in identical file to the starting one
         #self.save_leelaz_weights('restored.txt')
 
@@ -389,10 +440,10 @@ class TFProcess:
         sum_policy /= test_batches
         # Additionally rescale to [0, 1] so divide by 4
         sum_mse /= (4.0 * test_batches)
-        self.net.pb.training_params.learning_rate = self.lr
-        self.net.pb.training_params.mse_loss = sum_mse
-        self.net.pb.training_params.policy_loss = sum_policy
-        self.net.pb.training_params.accuracy = sum_accuracy
+        #self.net.pb.training_params.learning_rate = self.lr
+        #self.net.pb.training_params.mse_loss = sum_mse
+        #self.net.pb.training_params.policy_loss = sum_policy
+        #self.net.pb.training_params.accuracy = sum_accuracy
         test_summaries = tf.Summary(value=[
             tf.Summary.Value(tag="Accuracy", simple_value=sum_accuracy),
             tf.Summary.Value(tag="Policy Loss", simple_value=sum_policy),
@@ -537,14 +588,18 @@ class TFProcess:
         # NCHW format reduced to NC
         net = tf.reduce_mean(x, axis=[2, 3])
 
-        W_fc1 = weight_variable([channels, channels // ratio], name='se_fc1_w')
+
+        W_fc1 = weight_variable([channels, channels // ratio], name='se_fc1_w', regularize=self.distill_phase == 'student')
+
         b_fc1 = bias_variable([channels // ratio], name='se_fc1_b')
         self.weights.append(W_fc1)
         self.weights.append(b_fc1)
 
         net = tf.nn.relu(tf.add(tf.matmul(net, W_fc1), b_fc1))
 
-        W_fc2 = weight_variable([channels // ratio, 2 * channels], name='se_fc2_w')
+
+        W_fc2 = weight_variable([channels // ratio, 2 * channels], name='se_fc2_w', regularize=self.distill_phase == 'student')
+
         b_fc2 = bias_variable([2 * channels], name='se_fc2_b')
         self.weights.append(W_fc2)
         self.weights.append(b_fc2)
@@ -559,29 +614,38 @@ class TFProcess:
 
         return out
 
+
     def conv_block(self, inputs, filter_size, input_channels, output_channels):
+
         # The weights are internal to the batchnorm layer, so apply
         # a unique scope that we can store, and use to look them back up
         # later on.
         weight_key = self.get_batchnorm_key()
         conv_key = weight_key + "/conv_weight"
         W_conv = weight_variable([filter_size, filter_size,
-                                  input_channels, output_channels], name=conv_key)
+                                  input_channels, output_channels], name=conv_key, regularize=self.distill_phase == 'student')
+
+        use_gamma = not old_format
 
         with tf.variable_scope(weight_key):
             h_bn = \
                 tf.layers.batch_normalization(
                     conv2d(inputs, W_conv),
                     epsilon=1e-5, axis=1, fused=True,
+
                     center=True, scale=True,
+
                     virtual_batch_size=64,
                     training=self.training)
         h_conv = tf.nn.relu(h_bn)
 
+
         gamma_key = weight_key + "/batch_normalization/gamma:0"
+
         beta_key = weight_key + "/batch_normalization/beta:0"
         mean_key = weight_key + "/batch_normalization/moving_mean:0"
         var_key = weight_key + "/batch_normalization/moving_variance:0"
+
 
         gamma = tf.get_default_graph().get_tensor_by_name(gamma_key)
         beta = tf.get_default_graph().get_tensor_by_name(beta_key)
@@ -590,30 +654,38 @@ class TFProcess:
 
         self.weights.append(W_conv)
         self.weights.append(gamma)
+
         self.weights.append(beta)
         self.weights.append(mean)
         self.weights.append(var)
 
         return h_conv
 
-    def residual_block(self, inputs, channels):
+    def residual_block(self, inputs, channels, old_format):
         # First convnet
         orig = tf.identity(inputs)
+
+
         weight_key_1 = self.get_batchnorm_key() + "/"
         conv_key_1 = weight_key_1 + "conv_weight"
-        W_conv_1 = weight_variable([3, 3, channels, channels], name=conv_key_1)
+        W_conv_1 = weight_variable([3, 3, channels, channels], name=conv_key_1, regularize=self.distill_phase == 'student')
+
 
         # Second convnet
         weight_key_2 = self.get_batchnorm_key() + "/"
         conv_key_2 = weight_key_2 + "conv_weight"
-        W_conv_2 = weight_variable([3, 3, channels, channels], name=conv_key_2)
+
+        W_conv_2 = weight_variable([3, 3, channels, channels], name=conv_key_2, regularize=self.distill_phase == 'student')
+
 
         with tf.variable_scope(weight_key_1):
             h_bn1 = \
                 tf.layers.batch_normalization(
                     conv2d(inputs, W_conv_1),
                     epsilon=1e-5, axis=1, fused=True,
+
                     center=True, scale=True,
+
                     virtual_batch_size=64,
                     training=self.training)
         h_out_1 = tf.nn.relu(h_bn1)
@@ -622,14 +694,17 @@ class TFProcess:
                 tf.layers.batch_normalization(
                     conv2d(h_out_1, W_conv_2),
                     epsilon=1e-5, axis=1, fused=True,
+
                     center=True, scale=True,
                     virtual_batch_size=64,
                     training=self.training)
 
         gamma_key_1 = weight_key_1 + "/batch_normalization/gamma:0"
+
         beta_key_1 = weight_key_1 + "/batch_normalization/beta:0"
         mean_key_1 = weight_key_1 + "/batch_normalization/moving_mean:0"
         var_key_1 = weight_key_1 + "/batch_normalization/moving_variance:0"
+
 
         gamma_1 = tf.get_default_graph().get_tensor_by_name(gamma_key_1)
         beta_1 = tf.get_default_graph().get_tensor_by_name(beta_key_1)
@@ -637,9 +712,11 @@ class TFProcess:
         var_1 = tf.get_default_graph().get_tensor_by_name(var_key_1)
 
         gamma_key_2 = weight_key_2 + "/batch_normalization/gamma:0"
+
         beta_key_2 = weight_key_2 + "/batch_normalization/beta:0"
         mean_key_2 = weight_key_2 + "/batch_normalization/moving_mean:0"
         var_key_2 = weight_key_2 + "/batch_normalization/moving_variance:0"
+
 
         gamma_2 = tf.get_default_graph().get_tensor_by_name(gamma_key_2)
         beta_2 = tf.get_default_graph().get_tensor_by_name(beta_key_2)
@@ -648,24 +725,29 @@ class TFProcess:
 
         self.weights.append(W_conv_1)
         self.weights.append(gamma_1)
+
         self.weights.append(beta_1)
         self.weights.append(mean_1)
         self.weights.append(var_1)
 
         self.weights.append(W_conv_2)
+
         self.weights.append(gamma_2)
+
         self.weights.append(beta_2)
         self.weights.append(mean_2)
         self.weights.append(var_2)
 
         # Must be after adding weights to self.weights
+
         with tf.variable_scope(weight_key_2):
             h_se = self.squeeze_excitation(h_bn2, channels, self.SE_ratio)
+
         h_out_2 = tf.nn.relu(tf.add(h_se, orig))
 
         return h_out_2
 
-    def construct_net(self, planes):
+    def construct_net(self, planes, old_format=False):
         # NCHW format
         # batch, 112 input channels, 8 x 8
         x_planes = tf.reshape(planes, [-1, 112, 8, 8])
@@ -673,17 +755,20 @@ class TFProcess:
         # Input convolution
         flow = self.conv_block(x_planes, filter_size=3,
                                input_channels=112,
-                               output_channels=self.RESIDUAL_FILTERS)
+                               output_channels=self.RESIDUAL_FILTERS,
+                               old_format=old_format)
         # Residual tower
         for _ in range(0, self.RESIDUAL_BLOCKS):
-            flow = self.residual_block(flow, self.RESIDUAL_FILTERS)
+            flow = self.residual_block(flow, self.RESIDUAL_FILTERS, old_format)
 
         # Policy head
         conv_pol = self.conv_block(flow, filter_size=1,
                                    input_channels=self.RESIDUAL_FILTERS,
+
                                    output_channels=self.policy_channels)
         h_conv_pol_flat = tf.reshape(conv_pol, [-1, self.policy_channels*8*8])
-        W_fc1 = weight_variable([self.policy_channels*8*8, 1858], name='fc1/weight')
+        W_fc1 = weight_variable([self.policy_channels*8*8, 1858], name='fc1/weight', regularize=self.distill_phase == 'student')
+
         b_fc1 = bias_variable([1858], name='fc1/bias')
         self.weights.append(W_fc1)
         self.weights.append(b_fc1)
@@ -692,14 +777,15 @@ class TFProcess:
         # Value head
         conv_val = self.conv_block(flow, filter_size=1,
                                    input_channels=self.RESIDUAL_FILTERS,
-                                   output_channels=32)
+                                   output_channels=32,
+                                   old_format=old_format)
         h_conv_val_flat = tf.reshape(conv_val, [-1, 32*8*8])
-        W_fc2 = weight_variable([32 * 8 * 8, 128], name='fc2/weight')
+        W_fc2 = weight_variable([32 * 8 * 8, 128], name='fc2/weight', regularize=self.distill_phase == 'student')
         b_fc2 = bias_variable([128], name='fc2/bias')
         self.weights.append(W_fc2)
         self.weights.append(b_fc2)
         h_fc2 = tf.nn.relu(tf.add(tf.matmul(h_conv_val_flat, W_fc2), b_fc2))
-        W_fc3 = weight_variable([128, 1], name='fc3/weight')
+        W_fc3 = weight_variable([128, 1], name='fc3/weight', regularize=self.distill_phase == 'student')
         b_fc3 = bias_variable([1], name='fc3/bias')
         self.weights.append(W_fc3)
         self.weights.append(b_fc3)
